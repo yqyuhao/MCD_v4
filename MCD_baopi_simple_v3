@@ -1,0 +1,264 @@
+#!/bin/bash
+set +x
+#init
+######################
+Righton=/Righton_software
+bin_dir=$Righton/bin
+fastp=$bin_dir/fastp
+bwa=$bin_dir/bwa
+samtools=$bin_dir/samtools
+gatk=$bin_dir/gatk
+lianti=$bin_dir/lianti
+annovar=$bin_dir/table_annovar.pl
+fastqc=$bin_dir/fastqc
+bedtools=$bin_dir/bedtools
+snpEff=$bin_dir/snpEff
+target_dir=$Righton/target
+Ncpu_all=$(lscpu|awk '/^CPU\(s\)/{print int($2)}')
+database_dir=$Righton/database
+ref=$database_dir/ucsc.hg19.fasta
+annovar_dir=$database_dir/Annovar_hg19
+gene_list=$database_dir/gene_format/gene_list.xls
+aa_list=$database_dir/gene_format/aa_gene.xls
+aa_replace=$database_dir/gene_format/aa_replace.xls
+mut_type=$database_dir/gene_format/mut_type.xls
+vcf1=$database_dir/1000G_phase1.snps.high_confidence.hg19.vcf
+vcf2=$database_dir/Mills_and_1000G_gold_standard.indels.hg19.vcf
+analysis_dir=/data/RightonAuto/analysis
+config_dir=/data/RightonAuto/config
+function echo_usage()
+{
+cat<<END
+Usage:
+$0 -f config.csv
+	Input:
+		-f config.csv       	 config file.
+	Help:
+		-h                       Show this help.
+    Analysis Programs v1.0
+END
+exit 1
+}
+###function###
+function lianti_Analysis()
+{	
+	task=$1
+	fq1=`echo $task | cut -d "," -f 1`
+	fq2=`echo $task | cut -d "," -f 2`
+	id=`echo $task | cut -d "," -f 3`
+	sampleNo=`echo $task | cut -d "," -f 4`
+	projectId=`echo $task | cut -d "," -f 5`
+	if [[ $projectId -eq 3 ]];then bed="T554V1.bed";fi
+	if [[ -f $fq1 && -f $fq2 && -n $bed ]];then
+		i=${id}
+		sample_dir=$analysis_dir/${i}
+		mkdir -p $sample_dir
+		mkdir -p $sample_dir/Mutation
+		mkdir -p $sample_dir/QC
+		\cp $fq1 $fq2 $sample_dir
+		$fastp -i $fq1 -I $fq2 -o $sample_dir/${i}.paired.R1.fastq -O $sample_dir/${i}.paired.R2.fastq --thread $Ncpu --json $sample_dir/${i}.json --html $sample_dir/${i}.html
+		fq11=`basename $fq1`
+		fq22=`basename $fq2`
+		mkdir -p $sample_dir/${i}.paired.R1_QC $sample_dir/${i}.paired.R2_QC
+		$fastqc $sample_dir/${i}.paired.R1.fastq -o $sample_dir/${i}.paired.R1_QC & $fastqc $sample_dir/${i}.paired.R2.fastq -o $sample_dir/${i}.paired.R2_QC & \
+		perl $bin_dir/fastq2stat.pl $sample_dir/${i}.paired.R1.fastq & \
+		perl $bin_dir/fastq2stat.pl $sample_dir/${i}.paired.R2.fastq & \
+		perl $bin_dir/fastq2stat.pl $sample_dir/$fq11 & \
+		perl $bin_dir/fastq2stat.pl $sample_dir/$fq22 & \
+		$bwa mem -t $Ncpu -M -R "@RG\tID:${i}\tSM:${i}\tPL:ILLUMINA" $ref $sample_dir/${i}.paired.R1.fastq $sample_dir/${i}.paired.R2.fastq | $samtools view -q 10 -F 4 -@ $Ncpu -hb - > $sample_dir/${i}.bam
+		$gatk SortSam -I $sample_dir/${i}.bam -O $sample_dir/${i}.sort.bam -SO coordinate
+		$gatk MarkDuplicates --REMOVE_DUPLICATES FALSE -I $sample_dir/${i}.sort.bam -O $sample_dir/${i}.dup.bam -M $sample_dir/${i}.dedup.metrics &
+		$gatk MarkDuplicates --REMOVE_DUPLICATES TRUE -I $sample_dir/${i}.sort.bam -O $sample_dir/${i}.unique.bam -M $sample_dir/${i}.unique.metrics
+		$samtools view -q 10 -@ $Ncpu -h $sample_dir/${i}.unique.bam -L $target_dir/${bed} > $sample_dir/${i}.ontarget.bam
+		$gatk AddOrReplaceReadGroups -I $sample_dir/${i}.ontarget.bam -O $sample_dir/${i}.addhead.bam -LB ${i} -PL Illumina -PU hg19 -SM ${i} && $samtools index $sample_dir/${i}.addhead.bam
+		$gatk BaseRecalibrator -R $ref -I $sample_dir/${i}.addhead.bam --known-sites $vcf1 --known-sites $vcf2 -O $sample_dir/${i}.realign.table
+		$gatk ApplyBQSR --bqsr-recal-file $sample_dir/${i}.realign.table -R $ref -I $sample_dir/${i}.addhead.bam -O $sample_dir/${i}.ready.bam && $samtools index $sample_dir/${i}.ready.bam
+		$gatk CollectInsertSizeMetrics -I $sample_dir/${i}.ready.bam -O $sample_dir/${i}.insert_size_metrics.txt -H $sample_dir/${i}.insert_size_histogram.pdf &
+		$samtools stats $sample_dir/${i}.sort.bam |grep ^SN | cut -f 2- >$sample_dir/${i}.stat & \
+		$samtools stats $sample_dir/${i}.dup.bam | grep ^SN | cut -f 2- >$sample_dir/${i}.dup.stat & \
+		$samtools stats $sample_dir/${i}.unique.bam | grep ^SN | cut -f 2- >$sample_dir/${i}.unique.stat & \
+		$samtools stats $sample_dir/${i}.ontarget.bam | grep ^SN | cut -f 2- >$sample_dir/${i}.ontarget.stat & \
+		$samtools depth -d 100000 -a -b $target_dir/${bed} $sample_dir/${i}.ready.bam >$sample_dir/${i}.${bed}.depth && less $sample_dir/${i}.${bed}.depth |cut -f3 |sort -n >$sample_dir/${i}.${bed}.all.depth &
+		{
+			$lianti pileup -N 100000 -b $target_dir/${bed} -T 20 -Q20,30 -C -cf $ref $sample_dir/${i}.ready.bam > $sample_dir/${i}.ready.lianti-1.vcf
+			java -jar $snpEff/snpEff.jar hg19 $sample_dir/${i}.ready.lianti-1.vcf -stats $sample_dir/${i}.lianti.snpEff_genes.txt -htmlStats $sample_dir/${i}.lianti.snpEff_summary.html > $sample_dir/${i}.lianti.snpEff.vcf
+			less $sample_dir/${i}.lianti.snpEff.vcf | awk 'BEGIN {FS=OFS="\t"} {n=split($5,a,",");s=0;for(i=1;i<=n;i++){if(a[i]~/N/){s=s+1}};if(n!=s){print $0}}' |awk 'BEGIN {FS="\t";OFS="\t"} {ff=0;$4=toupper($4);$5=toupper($5);n5=split($5,a,",");split($10,b,":");split(b[2],c,",");split(b[3],d,",");for(i=2;i<=n5+1;i++){vd=c[i]+d[i];if(vd>=ff&&a[i-1]!~/N/){ff=vd;$5=a[i-1];$10="0/1:"c[1]","c[i]":"d[1]","d[i]}};print $0}' | awk 'BEGIN {FS="\t";OFS="\t"} {a=length($4);b=length($5);if(a==1||b==1||a==b){print $0};if(a>1&&b>1){if(a<b){t1=substr($4,2,a);t2=substr($5,2,a-1);if(t1==t2){$4=substr($4,1,1);c=substr($5,1,1);d=substr($5,a+1,b);$5=c""d;print $0};if(t1!=t2){x1=substr($5,1,1);x2=substr($5,2,b-a);y=substr($4,1,1);$5=x1""x2;$4=y;print $0}};if(a>b){t1=substr($4,2,b-1);t2=substr($5,2,b);if(t1==t2){$5=substr($5,1,1);c=substr($4,1,1);d=substr($4,b+1,a);$4=c""d;print $0};if(t1!=t2){x1=substr($4,1,1);x2=substr($4,2,a-b);y=substr($5,1,1);$4=x1""x2;$5=y;print $0}}}}'>$sample_dir/${i}.ready.lianti.vcf
+			perl $annovar $sample_dir/${i}.ready.lianti.vcf $annovar_dir -buildver hg19 -out $sample_dir/${i}.lianti -remove -protocol refGene,cytoBand,genomicSuperDups,avsnp150,cosmic92,clinvar_20170905,ljb26_all,exac03,1000g2015aug_all,intervar_20180118 -operation g,r,r,f,f,f,f,f,f,f -nastring . -vcfinput
+			echo -ne "Chr\tStart\tEnd\tRef\tAlt\tFunc.refGene\tGene.refGene\tGeneDetail.refGene\tExonicFunc.refGene\tAAChange.refGene\tcytoBand\tgenomicSuperDups\tavsnp150\tMutation.ratio\t1000g2015aug_all\tcosmic92\tCLNSIG\tCLNDN\tCLNDISDB\tCLNREVSTAT\tCLNALLELEID\tSIFT_score\tSIFT_pred\tPolyphen2_HDIV_score\tPolyphen2_HDIV_pred\tPolyphen2_HVAR_score\tPolyphen2_HVAR_pred\tLRT_score\tLRT_pred\tMutationTaster_score\tMutationTaster_pred\tMutationAssessor_score\tMutationAssessor_pred\tFATHMM_score\tFATHMM_pred\tRadialSVM_score\tRadialSVM_pred\tLR_score\tLR_pred\tVEST3_score\tCADD_raw\tCADD_phred\tGERP++_RS\tphyloP46way_placental\tphyloP100way_vertebrate\tSiPhy_29way_logOdds\tCADD13_RawScore\tCADD13_PHRED\tExAC_ALL\tExAC_AFR\tExAC_AMR\tExAC_EAS\tExAC_FIN\tExAC_NFE\tExAC_OTH\tExAC_SAS\tdgvMerged\tgwasCatalog\tphastConsElements46way\ttargetScanS\ttfbsConsSites\tcg46\tesp6500si_all\tDepth\tMutation.ratio\tOld_AAchange\tIntervar\tQ20.mutation.ratio\tQ20.mutation.ratio+/-\t\n" >$sample_dir/${i}.lianti.all.xls
+			cat $sample_dir/${i}.lianti.hg19_multianno.txt|awk 'BEGIN{FS="\t";OFS="\t"}$0!~/unknown/ && $0~/GT:ADF:ADR/ && ($6=="exonic"||$6=="splicing"||$6=="intronic"||$6=="exonic;splicing"||$6=="UTR5") {split($95,a,":");split(a[2],a1,",");split(a[3],a2,",");split($93,b,"ANN=");Depth=a1[1]+a2[1]+$91;if(Depth>0){Rate=$91/Depth;print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$12"\t"$13"\t"Rate"\t"$53"\t"$14"\t"$15"\t"$16"\t"$17"\t"$18"\t"$19"\t"$20"\t"$21"\t"$22"\t"$23"\t"$24"\t"$25"\t"$26"\t"$27"\t"$28"\t"$29"\t"$30"\t"$31"\t"$32"\t"$33"\t"$34"\t"$35"\t"$36"\t"$37"\t"$38"\t"$39"\t"$40"\t"$41"\t"$42"\t"$43"\t"$44"\t"".""\t"".""\t"$45"\t"$46"\t"$47"\t"$48"\t"$49"\t"$50"\t"$51"\t"$52"\t"".""\t"".""\t"".""\t"".""\t"".""\t"".""\t"".""\t"Depth"\t"Rate"\t"b[2]"\t"$54"\t"".""\t"".""\t"}}' | awk 'BEGIN {FS="\t";OFS="\t"} {n=split($66,a,",");s="";if($6=="splicing"||$6=="UTR5"||$6=="intronic"){for(i=1;i<=n;i++){split(a[i],b,"|");split(b[9],e,"/");t=b[4]":"b[7]":exon"e[1]":"b[10]":.";s=t","s}} else {for(i=1;i<=n;i++){split(a[i],b,"|");split(b[9],e,"/");if(b[11]!=""){t=b[4]":"b[7]":exon"e[1]":"b[10]":"b[11];if($4=="-") {if(t!~/del/ || t~/delins/){if(t!~/dup/){if(substr(b[1],2,length(b[1]))~$5){s=t","s}} else {s=t","s}}} else {s=t","s}}}};$66=s;print $0}'| awk 'BEGIN {FS="\t";OFS="\t"} {a=$66;$66=$10;$10=a;print $0}'|awk 'BEGIN {FS="\t";OFS="\t"} {if($4=="-"||$5=="-"){n=split($10,a,",");s="";for(i=1;i<n;i++){if(a[i]!~/>/){s=a[i]","s}};$10=s;print $0}else {print $0}}' | awk 'BEGIN {FS="\t";OFS="\t"} {if($4!="-"&&$5!="-"){n=split($10,a,",");b4=$4;b5=$5;if(b4=="A")c4="T";if(b4=="C")c4="G";if(b4=="G")c4="C";if(b4=="T")c4="A";if(b5=="A")c5="T";if(b5=="C")c5="G";if(b5=="G")c5="C";if(b5=="T")c5="A";s1=b4">"b5;s2=c4">"c5;t="";for(i=1;i<n;i++){if(a[i]~s1||a[i]~s2){t=a[i]","t}};$10=t;print $0}else {print $0}}'| awk 'BEGIN {FS="\t";OFS="\t"}{if($5=="-"){n=split($10,a,",");s="";for(i=1;i<n;i++){if(a[i]~/del/){s=a[i]","s}};$10=s;print $0} else if($4=="-"&&$10~/dup/){n=split($10,a,",");s="";for(i=1;i<n;i++){if(a[i]~/dup/){s=a[i]","s}};$10=s;print $0} else {print $0}}'|awk 'BEGIN {FS="\t";OFS="\t"} {if($4=="-"&&$10~/dup/){n=split($10,a,",");s="";for(i=1;i<n;i++){split(a[i],b,":");split(b[4],c,"dup");x=length(c[2]);y=length($5);if(x==y){s=a[i]","s}};$10=s;print $0} else if($5=="-"&&$10~/del/){n=split($10,a,",");s="";for(i=1;i<n;i++){split(a[i],b,":");split(b[4],c,"del");x=length(c[2]);y=length($4);if(x==y){s=a[i]","s}};$10=s;print $0} else print $0;}'|awk 'BEGIN {FS="\t";OFS="\t"} {if($10=="."||$10==""){$10=$8};if($10=="."||$10==""){$10=$66};print $0}'| awk 'BEGIN {FS=OFS="\t"} {if(($9=="stoploss"||$9=="stopgain")&&$10~/fs/){if($5=="-"){$9="frameshift deletion"};if($4=="-"){$9="frameshift insertion"};print $0} else {print $0}}'| awk 'BEGIN {FS=OFS="\t"} {s="";if($7=="FLT3"){n=split($10,a,",");for(i=1;i<n;i++){if(a[i]~/NM_004119/&&a[i]~/exon20/){a[i]=a[i]" TKD"};if(($4=="-")&&(a[i]~/NM_004119/)&&(a[i]~/exon14/||a[i]~/exon15/)){a[i]=a[i]" ITD"};s=a[i]","s};$10=s};print $0}'| awk 'BEGIN {FS=OFS="\t"} {$66=$10;gsub(/Ala/,"A",$66);gsub(/Arg/,"R",$66);gsub(/Asp/,"D",$66);gsub(/Cys/,"C",$66);gsub(/Gln/,"Q",$66);gsub(/Glu/,"E",$66);gsub(/His/,"H",$66);gsub(/Ile/,"I",$66);gsub(/Gly/,"G",$66);gsub(/Asn/,"N",$66);gsub(/Leu/,"L",$66);gsub(/Lys/,"K",$66);gsub(/Met/,"M",$66);gsub(/Phe/,"F",$66);gsub(/Pro/,"P",$66);gsub(/Ser/,"S",$66);gsub(/Thr/,"T",$66);gsub(/Trp/,"W",$66);gsub(/Tyr/,"Y",$66);gsub(/Val/,"V",$66);print $0}'>>$sample_dir/${i}.lianti.all.xls
+			less $sample_dir/${i}.lianti.all.xls | awk 'BEGIN {FS="\t";OFS="\t"} {if(($6=="exonic"||$6=="splicing"||$6=="exonic;splicing"||NR==1)&&($9!="synonymous SNV")){print $0}}' > $sample_dir/${i}.lianti.xls
+			wait
+		} &
+		wait
+		cat $sample_dir/${i}.lianti.xls | awk -F'\t' '!a[$1,$2,$3,$4,$5]++' | \
+		awk 'BEGIN {FS=OFS="\t"} NR==FNR {a[$1,$2,$3,$4,$5]=$6;next} {if(a[$1,$2,$3,$4,$5]!=""){$10=a[$1,$2,$3,$4,$5]};print $0}' $aa_replace - | \
+		awk 'BEGIN {FS=OFS="\t"} NR==FNR {a[$1,$2,$3,$4,$5]=$6;next} {if(a[$1,$2,$3,$4,$5]!=""){$9=a[$1,$2,$3,$4,$5]};print $0}' $mut_type - | \
+		awk 'BEGIN{FS=OFS="\t"}FNR>1&&FNR==NR{arry[$1]=$2}FNR<NR{if(!arry[$7]==NULL){$7=arry[$7]};print $0}' $gene_list - | \
+		awk 'BEGIN {FS=OFS="\t"} NR==FNR {a[$1]=$2;next} {n=split($10,b,":");for(i=1;i<=n;i++){if(a[b[i]]!=""){gsub(b[i],a[b[i]],$0);break}};print $0}' $aa_list - | \
+		awk 'BEGIN {FS=OFS="\t"}{if(NR==1||$6=="splicing"||$4=="-"||$5=="-"){print $0}else{n=split($10,a,",");s="";t=0;if(n==1){s=$10;t=1} else {for(i=1;i<n;i++){split(a[i],b,":");c1=substr(b[5],3,3);c2=substr(b[5],length(b[5])-2,3);if(c1!=c2){s=a[i]","s;t=t+1}}};$10=s;if(t>0){print $0}}}' > $sample_dir/${i}.hg19_multianno.xls
+
+		cat $sample_dir/${i}.hg19_multianno.xls | awk 'BEGIN {FS="\t";OFS="\t"} {if((($14>=0.001)&&($14<0.01))||(NR==1)) {print $0}}'>$sample_dir/${i}.hg19_multianno_less.xls
+		cat $sample_dir/${i}.hg19_multianno.xls | awk 'BEGIN {FS="\t";OFS="\t"} {if(($14>=0.01)||(NR==1)) {print $0}}' - > $sample_dir/${i}.hg19_multianno_more.xls
+		if [[ $projectId -eq 3 ]];then
+			cat $annovar_dir/hg19_clinvar.txt | awk -F'\t' '!a[$1,$2,$3,$4,$5]++' | awk -v id=$id 'BEGIN {FS=OFS="\t"} NR==FNR {a[$1,$2,$3,$4,$5]=$0;next} {if((a[$1,$2,$3,$4,$5]!=""&&$14>=0.05&&$64>=400)||FNR==1){if(FNR==1){print "id",$0} else{print id,$0}}}' - $sample_dir/${i}.hg19_multianno_more.xls > $sample_dir/${i}.mutation.xls
+		fi
+		echo -ne "id\tSampleName\tPanelInformation\tAverage_depth\tOntarget_reads_ratio\tMapped_ratio\tUniformity\tOntarget_Coverage\tRaw_R1_Bases\tRaw_R1_Q30_Bases\tRaw_R1_Q30%\t" >$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Raw_R1_Q20_Bases\tRaw_R1_Q20%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Raw_R2_Bases\tRaw_R2_Q30_Bases\tRaw_R2_Q30%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Raw_R2_Q20_Bases\tRaw_R2_Q20%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R1_Bases\tClean_R1_Q30_Bases\tClean_R1_Q30%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R1_Q20_Bases\tClean_R1_Q20%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R2_Bases\tClean_R2_Q30_Bases\tClean_R2_Q30%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Clean_R2_Q20_Bases\tClean_R2_Q20%\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "Average_read_length\tAverage_base_quality\tAverage_insert_size\tDuplication_rate(%)\tRaw_reads\tRaw_bases\tClean_reads\tClean_bases\tMapped_reads\tMapped_bases\tOntarget_reads\tOntarget_bases\tOntarget_bases_ratio\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "1X coverage rate(%)\t4X coverage rate(%)\t10X coverage rate(%)\t20X coverage rate(%)\t50X coverage rate(%)\t100X coverage rate(%)\t200X coverage rate(%)\t500X coverage rate(%)\tMedian_depth\tMode_insert_size\tminDepth\tq30\n" >>$sample_dir/${i}.Sequencing.QC.xls
+		Raw_reads=`expr $(cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}') + $(cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}')`
+		Raw_bases=`expr $(cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}') + $(cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}')`
+		Clean_reads=`expr $(cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}') + $(cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Total Num of Reads:/{split($0,a,":");printf a[2]}')`
+		Clean_bases=`expr $(cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}') + $(cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]}')`
+		Unique_reads=`cat $sample_dir/${i}.unique.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]}'`
+		Unique_bases=`cat $sample_dir/${i}.unique.stat|awk '$0~/bases mapped:/{split($0,a,"\t");printf a[2]}'`
+		Duplicate_reads=`cat $sample_dir/${i}.dup.stat|awk '$0~/reads duplicated:/{split($0,a,"\t");printf a[2]}'`
+		Duplication_rate=`echo $Duplicate_reads $Clean_reads | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		Accurate_mapping_reads=`cat $sample_dir/${i}.stat|awk '$0~/reads mapped:/{split($0,a,":");printf a[2]"\t"}'`  
+		Accurate_mapping_rate=`echo $Accurate_mapping_reads $Clean_reads | awk '{a=$1/$2;if(a<0.9){a=a+0.1};printf("%0.2f%%\n",a*100)}'`	   
+		Target_overlaped_reads=`cat $sample_dir/${i}.ontarget.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]}'`
+		Reads_capture_rate=`echo $Target_overlaped_reads $Unique_reads | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		Target_effective_bases=`awk '{sum += $3};END {print sum}' $sample_dir/${i}.${bed}.depth`
+		Bases_capture_rate=`echo $Target_effective_bases $Unique_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_bases=`cat $sample_dir/${i}.${bed}.all.depth|wc -l`
+		coverage_1x=`awk '$1>=1 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_4x=`awk '$1>=4 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_10x=`awk '$1>=10 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_20x=`awk '$1>=20 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_50x=`awk '$1>=50 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_100x=`awk '$1>=100 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_200x=`awk '$1>=200 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_500x=`awk '$1>=500 {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_sum=`awk '$1>0 {sum += $1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		coverage_1x_rate=`echo $coverage_1x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_4x_rate=`echo $coverage_4x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_10x_rate=`echo $coverage_10x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_20x_rate=`echo $coverage_20x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_50x_rate=`echo $coverage_50x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_100x_rate=`echo $coverage_100x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_200x_rate=`echo $coverage_200x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		coverage_500x_rate=`echo $coverage_500x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		average_coverage=$(printf "%d" $((coverage_sum/coverage_bases)))
+		median_coverage=`less $sample_dir/${i}.${bed}.all.depth|wc -l | xargs -i expr {} / 2 + 1 | xargs -i sed -n {}p $sample_dir/${i}.${bed}.all.depth`
+		Uniformity_x=`awk -v average_coverage=$average_coverage '$1>=(average_coverage*0.25) {sum += 1};END {print sum}' $sample_dir/${i}.${bed}.all.depth`
+		Uniformity=`echo $Uniformity_x $coverage_bases | awk '{printf("%0.2f%%\n",$1*100/$2)}'`
+		Mode_insert_size=`less $sample_dir/${i}.insert_size_metrics.txt | sed -n 8p | cut -f2`
+		echo -ne "${id}\t${i}\t${bed}\t$average_coverage\t$Reads_capture_rate\t$Accurate_mapping_rate\t$Uniformity\t$coverage_1x_rate\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Q30\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Q20\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Q30\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Q20\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		a=`cat $sample_dir/${fq11/.gz/}.stat|awk '$0~/Q30\%:/{split($0,a,":");print a[2]"\t"}'`
+		b=`cat $sample_dir/${fq22/.gz/}.stat|awk '$0~/Q30\%:/{split($0,a,":");print a[2]"\t"}'`
+		q30=`echo $a $b | awk '{printf("%0.2f\n"),($1+$2)/2}'`"%"
+		minDepth=`less $sample_dir/${i}.mutation.xls | awk 'BEGIN {FS=OFS="\t"} {if(NR!=1){print $65}}'|sort -n |head -n 1`
+		if [[ ! -n $minDepth ]];then minDepth=400;fi
+		cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q30\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R1.fastq.stat|awk '$0~/Q20\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Total Base Length:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q30 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q30\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q20 Base:/{split($0,a,":");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.paired.R2.fastq.stat|awk '$0~/Q20\%:/{split($0,a,":");printf("%0.2f%%\t",a[2])}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.stat|awk '$0~/average length:/{split($0,a,"\t");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.stat|awk '$0~/average quality:/{split($0,a,"\t");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.stat|awk '$0~/insert size average:/{split($0,a,"\t");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$Duplication_rate\t" >>$sample_dir/${i}.Sequencing.QC.xls 
+		echo -ne $Raw_reads"\t" >> $sample_dir/${i}.Sequencing.QC.xls
+		echo -ne $Raw_reads"\t" >> $sample_dir/${i}.Sequencing.QC.xls
+		echo -ne $Clean_reads"\t" >> $sample_dir/${i}.Sequencing.QC.xls
+		echo -ne $Clean_bases"\t" >> $sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.stat|awk '$0~/bases mapped \(cigar\):/{split($0,a,"\t");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		cat $sample_dir/${i}.ontarget.stat|awk '$0~/reads mapped:/{split($0,a,"\t");printf a[2]"\t"}' >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$Target_effective_bases\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$Bases_capture_rate\t" >>$sample_dir/${i}.Sequencing.QC.xls
+		echo -ne "$coverage_1x_rate\t$coverage_4x_rate\t$coverage_10x_rate\t$coverage_20x_rate\t$coverage_50x_rate\t$coverage_100x_rate\t$coverage_200x_rate\t$coverage_500x_rate\t$median_coverage\t$Mode_insert_size\t$minDepth\t$q30\n" >>$sample_dir/${i}.Sequencing.QC.xls
+		\mv $sample_dir/${i}.unique.stat $sample_dir/${i}.stat $sample_dir/${i}.dup.stat $sample_dir/${i}.paired.R1_QC $sample_dir/${i}.paired.R2_QC $sample_dir/${i}.paired.R1.fastq.stat $sample_dir/${i}.paired.R2.fastq.stat $sample_dir/QC/
+		\mv $sample_dir/${i}.Sequencing.QC.xls $sample_dir/${i}.ontarget.stat $sample_dir/${i}.${bed}.depth $sample_dir/${i}.${bed}.all.depth $sample_dir/QC/
+		\mv $sample_dir/${i}.ready.lianti-1.vcf $sample_dir/${i}.ready.lianti.vcf $sample_dir/${i}.lianti.all.xls $sample_dir/${i}.lianti.hg19_multianno.txt $sample_dir/${i}.lianti.hg19_multianno.vcf $sample_dir/${i}.hg19_multianno.xls $sample_dir/${i}.hg19_multianno_less.xls $sample_dir/${i}.hg19_multianno_more.xls $sample_dir/Mutation/
+		\mv $sample_dir/${fq11/.gz/}.stat $sample_dir/${fq22/.gz/}.stat $sample_dir/QC/
+		\mv $sample_dir/${i}.lianti.snpEff.vcf $sample_dir/${i}.lianti.xls $sample_dir/Mutation/
+		rm -f $sample_dir/${i}.mpileup $sample_dir/${i}.lianti.avinput $sample_dir/${i}.bam $sample_dir/${i}.addhead.bam $sample_dir/${i}.addhead.bam.bai $sample_dir/${i}.ontarget.bam
+		rm -f $sample_dir/${i}.realign.table $sample_dir/${i}.sort.bam
+		rm -f $sample_dir/${i}.dedup.metrics $sample_dir/${i}.dup.bam  $sample_dir/${i}.unique.bam  $sample_dir/${i}.unique.metrics
+		rm -f $sample_dir/${i}.paired.R1.fastq $sample_dir/${i}.paired.R2.fastq $sample_dir/${fq11/.gz/} $sample_dir/${fq22/.gz/}
+		rm -f $sample_dir/${i}.json $sample_dir/${i}.html $sample_dir/${i}.lianti.snpEff_summary.genes.txt $sample_dir/${i}.lianti.snpEff_summary.html
+		rm -f $sample_dir/${i}.sort.bam.bai $sample_dir/${i}.ready.bai
+		echo "${i} Work finished at `date`"
+	else
+		echo "fastq or bed not find"
+	fi
+}
+#####################
+#arguments
+#####################
+[ $# -eq 0 ] && echo_usage
+while getopts "f:hv" arg
+do
+        case $arg in
+	    f)
+		config=`basename $OPTARG`
+		config=$config_dir/$config
+		;;
+	    h)
+		echo_usage
+		exit 0
+		;;
+		v)
+		echo v1.0
+		exit 0
+		;;
+        ?)
+		echo "unknow argument"
+		echo_usage
+		exit 0
+		;;
+        esac
+done
+if [[ ! "$config" ]]
+then
+    echo_usage
+    exit 1
+fi
+#Sample information
+#Barcode,Target
+dos2unix $config
+sample_num=`cut -f1 $config|sort -u|wc -l`
+each_Ncpu=`expr $Ncpu_all / 4`
+if [ $sample_num -lt $each_Ncpu ];then Ncpu=`expr $Ncpu_all / $sample_num`;thread=$sample_num;else Ncpu=`expr $Ncpu_all / $each_Ncpu`;thread=$each_Ncpu;fi
+######Analysis#############
+tmp_fifofile=$PWD/$$.fifo
+mkfifo $tmp_fifofile
+exec 80<>$tmp_fifofile
+rm $tmp_fifofile
+for i in `seq $thread`
+do
+	echo >&80
+done
+while read id
+do
+	read -u 80
+	{
+		lianti_Analysis $id
+		echo >&80
+	}&
+done < $config
+wait
+exec 80>&-
+echo "Analysis Work finished at `date`"
