@@ -92,7 +92,7 @@ RUN git clone http://github.com/yqyuhao/MCD_v4.git && cd MCD_v4 && unzip annovar
 
 # copy esssential files
 WORKDIR $software/source
-RUN cd MCD_v4 && cp fastq2stat.pl api_baopi-post.py MCD_baopi_simple_v3 $software/bin/ && cp T554V1.bed $software/target/
+RUN cd MCD_v4 && cp fastq2stat.pl api_baopi-post.py MCD_baopi_simple_v4 $software/bin/ && cp T554V1.bed $software/target/
 
 # install essential packages
 WORKDIR $software/source
